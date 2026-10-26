@@ -58,7 +58,16 @@ except Exception as exc:  # pragma: no cover
 import hwpx_cracker as ref
 
 
-CL_DIR = Path(__file__).resolve().parent / "cl"
+def _resource_dir() -> Path:
+    """Directory that holds the bundled `cl/` kernels. When frozen by PyInstaller
+    the kernels are unpacked under sys._MEIPASS; otherwise they sit next to this
+    source file."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent
+
+
+CL_DIR = _resource_dir() / "cl"
 DEFAULT_BATCH = 1 << 20          # candidates per dispatch
 INTMAX = 0x7fffffff
 
@@ -415,6 +424,45 @@ def _progress(tested: int, started: float) -> None:
           f"rate={tested/elapsed:,.0f} cand/s", file=sys.stderr)
 
 
+def crack_document_cpu(args: argparse.Namespace, path: Path, mode: str,
+                       encodings: Sequence[str], started: float) -> int:
+    """문서 보호(document) 전용 CPU 크래커.
+
+    실제 한컴 문서 보호의 sha256-1k checksum은 '압축을 해제한 평문' 앞 1024바이트
+    기준이라, 후보 검증에 raw-DEFLATE 해제가 필요하다. GPU 커널에서 inflate 구현은
+    범위가 크므로, PBKDF2가 지배적인 이 프로파일은 OpenSSL 기반 CPU 검증으로 처리한다
+    (선택 문자/배포용은 GPU 유지). 수만 후보까지는 실용적인 속도가 나온다."""
+    with ref.HwpxPackage(path) as pkg:
+        infos = pkg.encrypted_infos()
+        info = ref.choose_document_probe(pkg, infos)
+        ct = pkg.read(info.full_path)
+
+    cs_kind = "sha256" if len(info.checksum) == 32 else "sha1"
+    print(f"[*] cpu verify: PBKDF2-HMAC-SHA1 x{info.iterations}, "
+          f"probe={info.full_path}, checksum={cs_kind}-1k(압축해제 후)", file=sys.stderr)
+
+    if args.wordlist:
+        candidates = ref.iter_wordlist(Path(args.wordlist))
+        print(f"[*] source    : wordlist {args.wordlist}", file=sys.stderr)
+    else:
+        custom = {"1": args.custom1 or "", "2": args.custom2 or "",
+                  "3": args.custom3 or "", "4": args.custom4 or ""}
+        candidates = ref.iter_mask(args.mask, custom)
+        print(f"[*] source    : mask {args.mask}", file=sys.stderr)
+
+    tested = 0
+    for c in candidates:
+        enc = ref.verify_document_password(ct, c, info, encodings)
+        tested += 1
+        if enc:
+            return _hit(c, enc, mode, tested)
+        if args.progress_every and tested % args.progress_every == 0:
+            _progress(tested, started)
+
+    print("[-] 지정한 범위에서 비밀번호를 찾지 못했습니다.")
+    return 1
+
+
 def crack(args: argparse.Namespace) -> int:
     path = Path(args.file)
     encodings = [e.strip() for e in args.encodings.split(",") if e.strip()]
@@ -427,21 +475,23 @@ def crack(args: argparse.Namespace) -> int:
         if mode == "none":
             print("[-] 지원 대상 보호 기능을 자동 탐지하지 못했습니다.")
             return 2
-
-        blob = extract_blob(pkg, mode)
+        if mode != "document":
+            blob = extract_blob(pkg, mode)
 
     print(f"[*] mode      : {mode}", file=sys.stderr)
+    started = time.monotonic()
+
+    # 문서 보호는 실제 한컴 checksum(압축 해제 후 sha256-1k) 검증에 DEFLATE 해제가
+    # 필요하므로 GPU 대신 CPU에서 처리한다. 선택 문자/배포용은 아래에서 GPU로 처리.
+    if mode == "document":
+        return crack_document_cpu(args, path, mode, encodings, started)
+
     if mode == "distribution":
         print(f"[*] verifiers : {len(blob.verifiers)} SHA-1 digest(s)", file=sys.stderr)
     elif mode == "partial":
         print(f"[*] prefix    : {ref.PARTIAL_PREFIX_TEXT!r} / UTF-16LE "
               f"({blob.nbits} bits)", file=sys.stderr)
-    else:
-        print(f"[*] pbkdf2    : iter={blob.iters}, key={blob.key_size}, "
-              f"probe={blob.nb} blk, start={'sha1' if blob.start_algo else 'sha256'}",
-              file=sys.stderr)
 
-    started = time.monotonic()
     tested_total = 0
 
     if args.wordlist:
