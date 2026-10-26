@@ -350,12 +350,24 @@ def checksum_digest(data: bytes, checksum_type: str, expected_len: int) -> bytes
 def checksum_matches(decrypted_compressed: bytes, info: EncryptionInfo) -> bool:
     if not info.checksum:
         return False
-    got = checksum_digest(
-        decrypted_compressed,
-        info.checksum_type,
-        len(info.checksum),
-    )
-    return got == info.checksum
+
+    # sha256-1k checksum의 기준 데이터는 두 가지 관찰이 있다:
+    #   (1) 압축(raw-DEFLATE) 바이트 앞 1024          — 초기 PoC/합성 샘플
+    #   (2) 압축을 해제한 평문 XML 앞 1024            — 실제 한컴 오피스 문서 보호
+    # 실제 파일은 (2)이므로 둘 다 시도해 호환성을 유지한다. (2)는 truncated
+    # 스트림이어도 최대 1088바이트까지만 인플레이트해 [:1024]를 확보한다.
+    data_variants = [decrypted_compressed]
+    try:
+        inflated = zlib.decompressobj(-15).decompress(decrypted_compressed, 1088)
+        if inflated:
+            data_variants.append(inflated)
+    except Exception:
+        pass
+
+    for data in data_variants:
+        if checksum_digest(data, info.checksum_type, len(info.checksum)) == info.checksum:
+            return True
+    return False
 
 
 def decrypt_encrypted_entry(
