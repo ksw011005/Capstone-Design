@@ -533,33 +533,47 @@ def verify_partial_password(
 
 def find_encrypt_strings(pkg: HwpxPackage) -> list[tuple[str, bytes]]:
     """
-    평문 XML에서 EncryptString 계열 attribute를 찾아 Base64 ciphertext 추출.
+    평문 XML에서 선택 문자 보호 ciphertext(EncryptString)를 추출.
+    두 가지 저장 형식을 모두 지원한다:
+      (1) EncryptString=".." attribute            — 프로젝트 PoC 표기
+      (2) 실제 한컴 오피스 형식 — <hp:stringParam name="Command"> 텍스트 안의
+          'PrivateInfo:set:..:EncryptString:wstring:<n>:<base64> MarkChar:..'
     선택 문자 보호 문서는 전체 패키지를 암호화하지 않으므로 XML 스캔이 가능하다.
+    (HWPX 파트는 ZIP-deflate라도 pkg.read가 자동 해제하므로 평문으로 읽힌다.)
     """
     found: list[tuple[str, bytes]] = []
+    seen: set[bytes] = set()
+
+    def add(name: str, value: str) -> None:
+        decoded = b64decode_loose(value)
+        if decoded and decoded not in seen:
+            seen.add(decoded)
+            found.append((name, decoded))
 
     for name in pkg.names:
         if not name.lower().endswith((".xml", ".hpf")):
             continue
 
         try:
-            raw = pkg.read(name)
-            text = raw.decode("utf-8")
-            root = ET.fromstring(text)
+            text = pkg.read(name).decode("utf-8")
         except Exception:
             continue
 
+        # (2) 실제 한컴 PrivateInfo 커맨드 문자열. base64 중간에 줄바꿈이 있을 수
+        #     있으므로 MarkChar(다음 필드) 또는 태그 종료 전까지 모아 공백을 제거한다.
+        for m in re.finditer(
+                r"EncryptString:wstring:\d+:(.*?)(?:\s+MarkChar|</)", text, re.S):
+            add(name, "".join(m.group(1).split()))
+
+        # (1) EncryptString / EcryptString attribute (PoC 표기)
+        try:
+            root = ET.fromstring(text)
+        except Exception:
+            continue
         for elem in root.iter():
             for attr_name, attr_value in elem.attrib.items():
-                lname = local_name(attr_name).lower()
-                # 자료에는 EncryptString, 메모에는 EcryptString 표기도 있어
-                # 두 경우 모두 좁게 허용한다.
-                if lname not in {"encryptstring", "ecryptstring"}:
-                    continue
-
-                decoded = b64decode_loose(attr_value)
-                if decoded:
-                    found.append((name, decoded))
+                if local_name(attr_name).lower() in {"encryptstring", "ecryptstring"}:
+                    add(name, attr_value)
 
     return found
 
